@@ -1,0 +1,23 @@
+name: minted-authz-test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/minted-authz-test.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run minted BOLA PoC
+        run: |
+          pip install -q eth-account requests
+          cp scripts/minted_test.py ./t.py
+          python3 t.py 2>&1 | tee out.txt
+          echo "--- RESULT ---"
+          grep -E "^###|BOLA TEST|BASELINE|NO-TOKEN|LOGIN" out.txt || true
